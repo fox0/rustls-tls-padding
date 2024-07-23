@@ -366,9 +366,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.8.0"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8a47f2fb521b70c11ce7369a6c5fa4bd6af7e5d62ec06303875bafe7c6ba245"
+checksum = "4ae74d9bd0a7530e8afd1770739ad34b36838829d6ad61818f9230f683f5ad77"
 dependencies = [
  "aws-lc-fips-sys",
  "aws-lc-sys",
@@ -380,9 +380,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2927c7af777b460b7ccd95f8b67acd7b4c04ec8896bf0c8e80ba30523cffc057"
+checksum = "2e89b6941c2d1a7045538884d6e760ccfffdf8e1ffc2613d8efa74305e1f3752"
 dependencies = [
  "bindgen",
  "cc",
@@ -1722,9 +1722,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openssl"
-version = "0.10.64"
+version = "0.10.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a0481286a310808298130d22dd1fef0fa571e05a8f44ec801801e84b216b1f"
+checksum = "9529f4786b70a3e8c61e11179af17ab6188ad8d0ded78c5529441ed39d4bd9c1"
 dependencies = [
  "bitflags 2.6.0",
  "cfg-if",
@@ -1748,9 +1748,9 @@ dependencies = [
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.102"
+version = "0.9.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c597637d56fbc83893a35eb0dd04b2b8e7a50c91e64e9493e398b5df4fb45fa2"
+checksum = "7f9e8deee91df40a943c71b917e5874b951d32a802526c85721ce3b776c929d6"
 dependencies = [
  "cc",
  "libc",
@@ -2210,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.11"
+version = "0.23.12"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -2228,7 +2228,7 @@ dependencies = [
  "ring",
  "rustls-pemfile 2.1.2",
  "rustls-pki-types",
- "rustls-webpki 0.102.5",
+ "rustls-webpki 0.102.6",
  "rustversion",
  "serde",
  "serde_json",
@@ -2251,7 +2251,7 @@ dependencies = [
  "fxhash",
  "itertools 0.13.0",
  "rayon",
- "rustls 0.23.11",
+ "rustls 0.23.12",
  "rustls-pemfile 2.1.2",
  "rustls-pki-types",
  "tikv-jemallocator",
@@ -2264,7 +2264,7 @@ dependencies = [
  "hickory-resolver",
  "regex",
  "ring",
- "rustls 0.23.11",
+ "rustls 0.23.12",
 ]
 
 [[package]]
@@ -2278,7 +2278,7 @@ dependencies = [
  "log",
  "mio",
  "rcgen",
- "rustls 0.23.11",
+ "rustls 0.23.12",
  "rustls-pemfile 2.1.2",
  "rustls-pki-types",
  "serde",
@@ -2296,7 +2296,7 @@ dependencies = [
  "num-bigint",
  "once_cell",
  "openssl",
- "rustls 0.23.11",
+ "rustls 0.23.12",
  "rustls-pemfile 2.1.2",
  "rustls-pki-types",
 ]
@@ -2332,7 +2332,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "env_logger",
- "rustls 0.23.11",
+ "rustls 0.23.12",
  "webpki-roots 0.26.3",
 ]
 
@@ -2353,9 +2353,9 @@ dependencies = [
  "rand_core",
  "rcgen",
  "rsa",
- "rustls 0.23.11",
+ "rustls 0.23.12",
  "rustls-pki-types",
- "rustls-webpki 0.102.5",
+ "rustls-webpki 0.102.6",
  "sha2",
  "signature",
  "webpki-roots 0.26.3",
@@ -2367,7 +2367,7 @@ name = "rustls-provider-test"
 version = "0.1.0"
 dependencies = [
  "hex",
- "rustls 0.23.11",
+ "rustls 0.23.12",
  "rustls-provider-example",
  "serde",
  "serde_json",
@@ -2385,9 +2385,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.102.5"
+version = "0.102.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9a6fccd794a42c2c105b513a2f62bc3fd8f3ba57a4593677ceb0bd035164d78"
+checksum = "8e6b52d4fda176fd835fdc55a835d4a89b8499cad995885a21149d5ad62f852e"
 dependencies = [
  "aws-lc-rs",
  "ring",
