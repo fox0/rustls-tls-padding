@@ -545,6 +545,9 @@ fn resumption_combinations() {
                 assert!(client
                     .negotiated_key_exchange_group()
                     .is_none());
+                assert!(server
+                    .negotiated_key_exchange_group()
+                    .is_none());
             } else {
                 assert_eq!(
                     client
@@ -553,10 +556,14 @@ fn resumption_combinations() {
                         .name(),
                     expected_kx
                 );
+                assert_eq!(
+                    server
+                        .negotiated_key_exchange_group()
+                        .unwrap()
+                        .name(),
+                    expected_kx
+                );
             }
-            assert!(server
-                .negotiated_key_exchange_group()
-                .is_none());
         }
     }
 }
@@ -2350,6 +2357,62 @@ fn server_complete_io_for_write() {
 }
 
 #[test]
+fn server_complete_io_for_write_eof() {
+    for kt in ALL_KEY_TYPES {
+        let (mut client, mut server) = make_pair(*kt);
+
+        do_handshake(&mut client, &mut server);
+
+        // Queue 20 bytes to write.
+        server
+            .writer()
+            .write_all(b"01234567890123456789")
+            .unwrap();
+        {
+            const BYTES_BEFORE_EOF: usize = 5;
+            let mut eof_writer = EofWriter::<BYTES_BEFORE_EOF>::default();
+
+            // Only BYTES_BEFORE_EOF should be written.
+            let (rdlen, wrlen) = server
+                .complete_io(&mut eof_writer)
+                .unwrap();
+            assert_eq!(rdlen, 0);
+            assert_eq!(wrlen, BYTES_BEFORE_EOF);
+
+            // Now nothing should be written.
+            let (rdlen, wrlen) = server
+                .complete_io(&mut eof_writer)
+                .unwrap();
+            assert_eq!(rdlen, 0);
+            assert_eq!(wrlen, 0);
+        }
+    }
+}
+
+#[derive(Default)]
+struct EofWriter<const N: usize> {
+    written: usize,
+}
+
+impl<const N: usize> std::io::Write for EofWriter<N> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let prev = self.written;
+        self.written = N.min(self.written + buf.len());
+        Ok(self.written - prev)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<const N: usize> std::io::Read for EofWriter<N> {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        panic!() // This is a writer, it should not be read from.
+    }
+}
+
+#[test]
 fn server_complete_io_for_read() {
     for kt in ALL_KEY_TYPES {
         let (mut client, mut server) = make_pair(*kt);
@@ -3589,9 +3652,9 @@ fn vectored_write_for_server_handshake_with_half_rtt_data() {
         let mut pipe = OtherSession::new(&mut client);
         let wrlen = server.write_tls(&mut pipe).unwrap();
         // don't assert exact sizes here, to avoid a brittle test
-        assert!(wrlen > 2500); // its pretty big (contains cert chain)
+        assert!(wrlen > 2400); // its pretty big (contains cert chain)
         assert_eq!(pipe.writevs.len(), 1); // only one writev
-        assert_eq!(pipe.writevs[0].len(), 8); // at least a server hello/ccs/cert/serverkx/0.5rtt data
+        assert_eq!(pipe.writevs[0].len(), 5); // at least a server hello/ccs/cert/serverkx/0.5rtt data
     }
 
     client.process_new_packets().unwrap();
@@ -3631,9 +3694,9 @@ fn check_half_rtt_does_not_work(server_config: ServerConfig) {
         let mut pipe = OtherSession::new(&mut client);
         let wrlen = server.write_tls(&mut pipe).unwrap();
         // don't assert exact sizes here, to avoid a brittle test
-        assert!(wrlen > 2500); // its pretty big (contains cert chain)
+        assert!(wrlen > 2400); // its pretty big (contains cert chain)
         assert_eq!(pipe.writevs.len(), 1); // only one writev
-        assert!(pipe.writevs[0].len() >= 6); // at least a server hello/ccs/cert/serverkx data
+        assert_eq!(pipe.writevs[0].len(), 3); // at least a server hello/ccs/cert/serverkx data, in one message
     }
 
     // client second flight
@@ -3698,7 +3761,7 @@ fn vectored_write_for_client_handshake() {
         let mut pipe = OtherSession::new(&mut server);
         let wrlen = client.write_tls(&mut pipe).unwrap();
         assert_eq!(wrlen, 154);
-        // CCS, finished, then two application datas
+        // CCS, finished, then two application data records
         assert_eq!(pipe.writevs, vec![vec![6, 74, 42, 32]]);
     }
 
@@ -3814,6 +3877,7 @@ enum ClientStorageOp {
 struct ClientStorage {
     storage: Arc<dyn rustls::client::ClientSessionStore>,
     ops: Mutex<Vec<ClientStorageOp>>,
+    alter_max_early_data_size: Option<(u32, u32)>,
 }
 
 impl ClientStorage {
@@ -3821,7 +3885,12 @@ impl ClientStorage {
         Self {
             storage: Arc::new(rustls::client::ClientSessionMemoryCache::new(1024)),
             ops: Mutex::new(Vec::new()),
+            alter_max_early_data_size: None,
         }
+    }
+
+    fn alter_max_early_data_size(&mut self, expected: u32, altered: u32) {
+        self.alter_max_early_data_size = Some((expected, altered));
     }
 
     #[cfg(feature = "tls12")]
@@ -3900,8 +3969,13 @@ impl rustls::client::ClientSessionStore for ClientStorage {
     fn insert_tls13_ticket(
         &self,
         server_name: ServerName<'static>,
-        value: rustls::client::Tls13ClientSessionValue,
+        mut value: rustls::client::Tls13ClientSessionValue,
     ) {
+        if let Some((expected, desired)) = self.alter_max_early_data_size {
+            assert_eq!(value.max_early_data_size(), expected);
+            value._private_set_max_early_data_size(desired);
+        }
+
         self.ops
             .lock()
             .unwrap()
@@ -4150,6 +4224,159 @@ fn early_data_can_be_rejected_by_server() {
     do_handshake(&mut client, &mut server);
 
     assert!(!client.is_early_data_accepted());
+}
+
+#[test]
+fn early_data_is_limited_on_client() {
+    let (client_config, server_config) = early_data_configs();
+
+    // warm up
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        1234
+    );
+    client
+        .early_data()
+        .unwrap()
+        .flush()
+        .unwrap();
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(&[0xaa; 1234 + 1])
+            .unwrap(),
+        1234
+    );
+    do_handshake(&mut client, &mut server);
+
+    let mut received_early_data = [0u8; 1234];
+    assert_eq!(
+        server
+            .early_data()
+            .expect("early_data didn't happen")
+            .read(&mut received_early_data)
+            .expect("early_data failed unexpectedly"),
+        1234
+    );
+    assert_eq!(&received_early_data[..], [0xaa; 1234]);
+}
+
+fn early_data_configs_allowing_client_to_send_excess_data() -> (Arc<ClientConfig>, Arc<ServerConfig>)
+{
+    let (client_config, server_config) = early_data_configs();
+
+    // adjust client session storage to corrupt received max_early_data_size
+    let mut client_config = Arc::into_inner(client_config).unwrap();
+    let mut storage = ClientStorage::new();
+    storage.alter_max_early_data_size(1234, 2024);
+    client_config.resumption = Resumption::store(Arc::new(storage));
+    let client_config = Arc::new(client_config);
+
+    // warm up
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+    (client_config, server_config)
+}
+
+#[test]
+fn server_detects_excess_early_data() {
+    let (client_config, server_config) = early_data_configs_allowing_client_to_send_excess_data();
+
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        2024
+    );
+    client
+        .early_data()
+        .unwrap()
+        .flush()
+        .unwrap();
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(&[0xaa; 2024])
+            .unwrap(),
+        2024
+    );
+    assert_eq!(
+        do_handshake_until_error(&mut client, &mut server),
+        Err(ErrorFromPeer::Server(Error::PeerMisbehaved(
+            PeerMisbehaved::TooMuchEarlyDataReceived
+        ))),
+    );
+}
+
+// regression test for https://github.com/rustls/rustls/issues/2096
+#[test]
+fn server_detects_excess_streamed_early_data() {
+    let (client_config, server_config) = early_data_configs_allowing_client_to_send_excess_data();
+
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        2024
+    );
+    client
+        .early_data()
+        .unwrap()
+        .flush()
+        .unwrap();
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(&[0xaa; 1024])
+            .unwrap(),
+        1024
+    );
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+
+    let mut received_early_data = [0u8; 1024];
+    assert_eq!(
+        server
+            .early_data()
+            .expect("early_data didn't happen")
+            .read(&mut received_early_data)
+            .expect("early_data failed unexpectedly"),
+        1024
+    );
+    assert_eq!(&received_early_data[..], [0xaa; 1024]);
+
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(&[0xbb; 1000])
+            .unwrap(),
+        1000
+    );
+    transfer(&mut client, &mut server);
+    assert_eq!(
+        server.process_new_packets(),
+        Err(Error::PeerMisbehaved(
+            PeerMisbehaved::TooMuchEarlyDataReceived
+        ))
+    );
 }
 
 mod test_quic {
@@ -4995,7 +5222,7 @@ fn test_client_sends_helloretryrequest() {
         let wrlen = server.write_tls(&mut pipe).unwrap();
         assert!(wrlen > 200);
         assert_eq!(pipe.writevs.len(), 1);
-        assert!(pipe.writevs[0].len() == 5); // server hello / encrypted exts / cert / cert-verify / finished
+        assert_eq!(pipe.writevs[0].len(), 2); // { server hello / encrypted exts / cert / cert-verify } / finished
     }
 
     assert_eq!(
@@ -7419,6 +7646,48 @@ fn test_keys_match_for_all_signing_key_types() {
         ck.keys_match().unwrap();
         println!("{kt:?} ok");
     }
+}
+
+#[test]
+fn tls13_packed_handshake() {
+    // transcript requires selection of X25519
+    if provider_is_fips() {
+        return;
+    }
+
+    // regression test for https://github.com/rustls/rustls/issues/2040
+    // (did not affect the buffered api)
+    let client_config = finish_client_config(
+        KeyType::Rsa2048,
+        ClientConfig::builder_with_provider(unsafe_plaintext_crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap(),
+    );
+
+    let mut client =
+        ClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+
+    let mut hello = Vec::new();
+    client
+        .write_tls(&mut io::Cursor::new(&mut hello))
+        .unwrap();
+
+    let first_flight = include_bytes!("data/bug2040-message-1.bin");
+    client
+        .read_tls(&mut io::Cursor::new(first_flight))
+        .unwrap();
+    client.process_new_packets().unwrap();
+
+    let second_flight = include_bytes!("data/bug2040-message-2.bin");
+    client
+        .read_tls(&mut io::Cursor::new(second_flight))
+        .unwrap();
+    assert_eq!(
+        client
+            .process_new_packets()
+            .unwrap_err(),
+        Error::InvalidCertificate(CertificateError::UnknownIssuer),
+    );
 }
 
 const CONFIDENTIALITY_LIMIT: u64 = 1024;

@@ -12,16 +12,15 @@ use pki_types::{DnsName, UnixTime};
 
 use super::hs;
 use crate::builder::ConfigBuilder;
+use crate::common_state::{CommonState, Side};
 #[cfg(feature = "std")]
-use crate::common_state::Protocol;
-use crate::common_state::{CommonState, Side, State};
+use crate::common_state::{Protocol, State};
 use crate::conn::{ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon};
 #[cfg(doc)]
 use crate::crypto;
 use crate::crypto::CryptoProvider;
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::error::Error;
-#[cfg(feature = "logging")]
 use crate::log::trace;
 use crate::msgs::base::Payload;
 use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtension};
@@ -248,7 +247,7 @@ pub struct ServerConfig {
     pub max_fragment_size: Option<usize>,
 
     /// How to store client sessions.
-    pub session_storage: Arc<dyn StoresServerSessions + Send + Sync>,
+    pub session_storage: Arc<dyn StoresServerSessions>,
 
     /// How to produce tickets.
     pub ticketer: Arc<dyn ProducesTickets>,
@@ -564,9 +563,6 @@ mod connection {
         /// Make a new ServerConnection.  `config` controls how
         /// we behave in the TLS protocol.
         pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
-            let mut common = CommonState::new(Side::Server);
-            common.set_max_fragment_size(config.max_fragment_size)?;
-            common.enable_secret_extraction = config.enable_secret_extraction;
             Ok(Self {
                 inner: ConnectionCommon::from(ConnectionCore::for_server(config, Vec::new())?),
             })
@@ -864,9 +860,6 @@ pub struct UnbufferedServerConnection {
 impl UnbufferedServerConnection {
     /// Make a new ServerConnection. `config` controls how we behave in the TLS protocol.
     pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
-        let mut common = CommonState::new(Side::Server);
-        common.set_max_fragment_size(config.max_fragment_size)?;
-        common.enable_secret_extraction = config.enable_secret_extraction;
         Ok(Self {
             inner: UnbufferedConnectionCommon::from(ConnectionCore::for_server(
                 config,
@@ -971,8 +964,10 @@ impl Debug for Accepted {
     }
 }
 
+#[cfg(feature = "std")]
 struct Accepting;
 
+#[cfg(feature = "std")]
 impl State<ServerConnectionData> for Accepting {
     fn handle<'m>(
         self: Box<Self>,
@@ -992,7 +987,10 @@ impl State<ServerConnectionData> for Accepting {
 
 pub(super) enum EarlyDataState {
     New,
-    Accepted(ChunkVecBuffer),
+    Accepted {
+        received: ChunkVecBuffer,
+        left: usize,
+    },
     Rejected,
 }
 
@@ -1008,12 +1006,15 @@ impl EarlyDataState {
     }
 
     pub(super) fn accept(&mut self, max_size: usize) {
-        *self = Self::Accepted(ChunkVecBuffer::new(Some(max_size)));
+        *self = Self::Accepted {
+            received: ChunkVecBuffer::new(Some(max_size)),
+            left: max_size,
+        };
     }
 
     #[cfg(feature = "std")]
     fn was_accepted(&self) -> bool {
-        matches!(self, Self::Accepted(_))
+        matches!(self, Self::Accepted { .. })
     }
 
     pub(super) fn was_rejected(&self) -> bool {
@@ -1022,7 +1023,9 @@ impl EarlyDataState {
 
     fn pop(&mut self) -> Option<Vec<u8>> {
         match self {
-            Self::Accepted(ref mut received) => received.pop(),
+            Self::Accepted {
+                ref mut received, ..
+            } => received.pop(),
             _ => None,
         }
     }
@@ -1030,7 +1033,9 @@ impl EarlyDataState {
     #[cfg(feature = "std")]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Accepted(ref mut received) => received.read(buf),
+            Self::Accepted {
+                ref mut received, ..
+            } => received.read(buf),
             _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
         }
     }
@@ -1038,7 +1043,9 @@ impl EarlyDataState {
     #[cfg(read_buf)]
     fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> io::Result<()> {
         match self {
-            Self::Accepted(ref mut received) => received.read_buf(cursor),
+            Self::Accepted {
+                ref mut received, ..
+            } => received.read_buf(cursor),
             _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
         }
     }
@@ -1046,8 +1053,12 @@ impl EarlyDataState {
     pub(super) fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> bool {
         let available = bytes.bytes().len();
         match self {
-            Self::Accepted(ref mut received) if received.apply_limit(available) == available => {
+            Self::Accepted {
+                ref mut received,
+                ref mut left,
+            } if received.apply_limit(available) == available && available <= *left => {
                 received.append(bytes.into_vec());
+                *left -= available;
                 true
             }
             _ => false,
@@ -1059,7 +1070,12 @@ impl Debug for EarlyDataState {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::New => write!(f, "EarlyDataState::New"),
-            Self::Accepted(buf) => write!(f, "EarlyDataState::Accepted({})", buf.len()),
+            Self::Accepted { received, left } => write!(
+                f,
+                "EarlyDataState::Accepted {{ received: {}, left: {} }}",
+                received.len(),
+                left
+            ),
             Self::Rejected => write!(f, "EarlyDataState::Rejected"),
         }
     }

@@ -12,28 +12,25 @@ use std::{env, fs, net, process, thread, time};
 use base64::prelude::{Engine, BASE64_STANDARD};
 use pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::{ClientConfig, ClientConnection, Resumption, WebPkiServerVerifier};
-#[cfg(all(feature = "ring", not(feature = "aws_lc_rs")))]
-use rustls::crypto::ring as provider;
-use rustls::crypto::{CryptoProvider, SupportedKxGroup};
-use rustls::internal::msgs::codec::Codec;
+use rustls::client::{
+    ClientConfig, ClientConnection, EchConfig, EchGreaseConfig, EchMode, EchStatus, Resumption,
+    WebPkiServerVerifier,
+};
+use rustls::crypto::aws_lc_rs::hpke;
+use rustls::crypto::hpke::{Hpke, HpkePublicKey};
+use rustls::crypto::{aws_lc_rs, ring, CryptoProvider, SupportedKxGroup};
+use rustls::internal::msgs::codec::{Codec, Reader};
+use rustls::internal::msgs::handshake::EchConfigPayload;
 use rustls::internal::msgs::persist::ServerSessionValue;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::server::{ClientHello, ServerConfig, ServerConnection, WebPkiClientVerifier};
+use rustls::server::{
+    ClientHello, ProducesTickets, ServerConfig, ServerConnection, WebPkiClientVerifier,
+};
 use rustls::{
     client, compress, server, sign, version, AlertDescription, CertificateCompressionAlgorithm,
     CertificateError, Connection, DigitallySignedStruct, DistinguishedName, Error, HandshakeKind,
     InvalidMessage, NamedGroup, PeerIncompatible, PeerMisbehaved, ProtocolVersion, RootCertStore,
     Side, SignatureAlgorithm, SignatureScheme, SupportedProtocolVersion,
-};
-#[cfg(feature = "aws_lc_rs")]
-use rustls::{
-    client::{EchConfig, EchGreaseConfig, EchMode, EchStatus},
-    crypto::aws_lc_rs as provider,
-    crypto::aws_lc_rs::hpke,
-    crypto::hpke::{Hpke, HpkePublicKey},
-    internal::msgs::codec::Reader,
-    internal::msgs::handshake::EchConfigPayload,
 };
 
 static BOGO_NACK: i32 = 89;
@@ -53,6 +50,7 @@ struct Options {
     resumes: usize,
     verify_peer: bool,
     require_any_client_cert: bool,
+    server_preference: bool,
     root_hint_subjects: Vec<DistinguishedName>,
     offer_no_client_cas: bool,
     tickets: bool,
@@ -65,6 +63,7 @@ struct Options {
     check_close_notify: bool,
     host_name: String,
     use_sni: bool,
+    trusted_cert_file: String,
     key_file: String,
     cert_file: String,
     protocols: Vec<String>,
@@ -75,7 +74,7 @@ struct Options {
     max_version: Option<ProtocolVersion>,
     server_ocsp_response: Vec<u8>,
     use_signing_scheme: u16,
-    curves: Option<Vec<u16>>,
+    groups: Option<Vec<NamedGroup>>,
     export_keying_material: usize,
     export_keying_material_label: String,
     export_keying_material_context: String,
@@ -94,6 +93,7 @@ struct Options {
     expect_handshake_kind: Option<Vec<HandshakeKind>>,
     expect_handshake_kind_resumed: Option<Vec<HandshakeKind>>,
     install_cert_compression_algs: CompressionAlgs,
+    selected_provider: SelectedProvider,
     provider: CryptoProvider,
     ech_config_list: Option<pki_types::EchConfigListBytes<'static>>,
     expect_ech_accept: bool,
@@ -103,10 +103,14 @@ struct Options {
     on_initial_expect_ech_accept: bool,
     enable_ech_grease: bool,
     send_key_update: bool,
+    expect_curve_id: Option<NamedGroup>,
+    on_initial_expect_curve_id: Option<NamedGroup>,
+    on_resume_expect_curve_id: Option<NamedGroup>,
 }
 
 impl Options {
     fn new() -> Self {
+        let selected_provider = SelectedProvider::from_env();
         Options {
             port: 0,
             shim_id: 0,
@@ -125,8 +129,10 @@ impl Options {
             shut_down_after_handshake: false,
             check_close_notify: false,
             require_any_client_cert: false,
+            server_preference: false,
             root_hint_subjects: vec![],
             offer_no_client_cas: false,
+            trusted_cert_file: "".to_string(),
             key_file: "".to_string(),
             cert_file: "".to_string(),
             protocols: vec![],
@@ -137,7 +143,7 @@ impl Options {
             max_version: None,
             server_ocsp_response: vec![],
             use_signing_scheme: 0,
-            curves: None,
+            groups: None,
             export_keying_material: 0,
             export_keying_material_label: "".to_string(),
             export_keying_material_context: "".to_string(),
@@ -156,7 +162,8 @@ impl Options {
             expect_handshake_kind: None,
             expect_handshake_kind_resumed: Some(vec![HandshakeKind::Resumed]),
             install_cert_compression_algs: CompressionAlgs::None,
-            provider: default_provider(),
+            selected_provider,
+            provider: selected_provider.provider(),
             ech_config_list: None,
             expect_ech_accept: false,
             expect_ech_retry_configs: None,
@@ -165,6 +172,9 @@ impl Options {
             on_initial_expect_ech_accept: false,
             enable_ech_grease: false,
             send_key_update: false,
+            expect_curve_id: None,
+            on_initial_expect_curve_id: None,
+            on_resume_expect_curve_id: None,
         }
     }
 
@@ -196,13 +206,60 @@ impl Options {
     }
 }
 
-fn default_provider() -> CryptoProvider {
-    // ensure all suites and kx groups are included (even in fips builds)
-    // as non-fips test cases require them
-    CryptoProvider {
-        kx_groups: provider::ALL_KX_GROUPS.to_vec(),
-        cipher_suites: provider::ALL_CIPHER_SUITES.to_vec(),
-        ..provider::default_provider()
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SelectedProvider {
+    AwsLcRs,
+    AwsLcRsFips,
+    PostQuantum,
+    Ring,
+}
+
+impl SelectedProvider {
+    fn from_env() -> Self {
+        match env::var("BOGO_SHIM_PROVIDER")
+            .ok()
+            .as_deref()
+        {
+            None | Some("aws-lc-rs") => Self::AwsLcRs,
+            Some("aws-lc-rs-fips") => Self::AwsLcRsFips,
+            Some("post-quantum") => Self::PostQuantum,
+            Some("ring") => Self::Ring,
+            Some(other) => panic!("unrecognised value for BOGO_SHIM_PROVIDER: {other:?}"),
+        }
+    }
+
+    fn provider(&self) -> CryptoProvider {
+        match self {
+            Self::AwsLcRs | Self::AwsLcRsFips | Self::PostQuantum => {
+                // ensure all suites and kx groups are included (even in fips builds)
+                // as non-fips test cases require them.  runner activates fips mode via -fips-202205 option
+                // this includes rustls-post-quantum, which just returns an altered
+                // version of `aws_lc_rs::default_provider()`
+                CryptoProvider {
+                    kx_groups: aws_lc_rs::ALL_KX_GROUPS.to_vec(),
+                    cipher_suites: aws_lc_rs::ALL_CIPHER_SUITES.to_vec(),
+                    ..aws_lc_rs::default_provider()
+                }
+            }
+
+            Self::Ring => ring::default_provider(),
+        }
+    }
+
+    fn ticketer(&self) -> Arc<dyn ProducesTickets> {
+        match self {
+            Self::AwsLcRs | Self::AwsLcRsFips | Self::PostQuantum => {
+                aws_lc_rs::Ticketer::new().unwrap()
+            }
+            Self::Ring => ring::Ticketer::new().unwrap(),
+        }
+    }
+
+    fn supports_ech(&self) -> bool {
+        match *self {
+            Self::AwsLcRs | Self::AwsLcRsFips | Self::PostQuantum => true,
+            Self::Ring => false,
+        }
     }
 }
 
@@ -224,12 +281,21 @@ fn load_key(filename: &str) -> PrivateKeyDer<'static> {
     keys.pop().unwrap().into()
 }
 
-fn load_root_certs() -> Arc<RootCertStore> {
+fn load_root_certs(filename: &str) -> Arc<RootCertStore> {
     let mut roots = RootCertStore::empty();
 
-    // this is not actually used by the tests, but must be non-empty
-    roots.add_parsable_certificates(load_cert("cert.pem"));
+    // -verify-peer can be used without specifying a root cert,
+    // to test (eg) client auth without actually looking at the certs.
+    //
+    // but WebPkiClientVerifier requires a non-empty set of roots.
+    //
+    // use an unrelated cert we have lying around.
+    let filename = match filename {
+        "" => "../../../../../test-ca/rsa-2048/ca.cert",
+        filename => filename,
+    };
 
+    roots.add_parsable_certificates(load_cert(filename));
     Arc::new(roots)
 }
 
@@ -263,13 +329,19 @@ struct DummyClientAuth {
 }
 
 impl DummyClientAuth {
-    fn new(mandatory: bool, root_hint_subjects: Vec<DistinguishedName>) -> Self {
+    fn new(
+        trusted_cert_file: &str,
+        mandatory: bool,
+        root_hint_subjects: Vec<DistinguishedName>,
+    ) -> Self {
         Self {
             mandatory,
             root_hint_subjects,
             parent: WebPkiClientVerifier::builder_with_provider(
-                load_root_certs(),
-                provider::default_provider().into(),
+                load_root_certs(trusted_cert_file),
+                SelectedProvider::from_env()
+                    .provider()
+                    .into(),
             )
             .build()
             .unwrap(),
@@ -330,11 +402,13 @@ struct DummyServerAuth {
 }
 
 impl DummyServerAuth {
-    fn new() -> Self {
+    fn new(trusted_cert_file: &str) -> Self {
         DummyServerAuth {
             parent: WebPkiServerVerifier::builder_with_provider(
-                load_root_certs(),
-                provider::default_provider().into(),
+                load_root_certs(trusted_cert_file),
+                SelectedProvider::from_env()
+                    .provider()
+                    .into(),
             )
             .build()
             .unwrap(),
@@ -466,18 +540,6 @@ fn lookup_scheme(scheme: u16) -> SignatureScheme {
     }
 }
 
-fn lookup_kx_group(group: u16) -> &'static dyn SupportedKxGroup {
-    match group {
-        0x001d => provider::kx_group::X25519,
-        0x0017 => provider::kx_group::SECP256R1,
-        0x0018 => provider::kx_group::SECP384R1,
-        _ => {
-            println_err!("Unsupported kx group {:04x}", group);
-            process::exit(BOGO_NACK);
-        }
-    }
-}
-
 #[derive(Debug)]
 struct ServerCacheWithResumptionDelay {
     delay: u32,
@@ -541,6 +603,7 @@ fn make_server_cfg(opts: &Options) -> Arc<ServerConfig> {
     let client_auth =
         if opts.verify_peer || opts.offer_no_client_cas || opts.require_any_client_cert {
             Arc::new(DummyClientAuth::new(
+                &opts.trusted_cert_file,
                 opts.require_any_client_cert,
                 opts.root_hint_subjects.clone(),
             ))
@@ -551,32 +614,26 @@ fn make_server_cfg(opts: &Options) -> Arc<ServerConfig> {
     let cert = load_cert(&opts.cert_file);
     let key = load_key(&opts.key_file);
 
-    let kx_groups = if let Some(curves) = &opts.curves {
-        curves
-            .iter()
-            .map(|curveid| lookup_kx_group(*curveid))
-            .collect()
-    } else {
-        opts.provider.kx_groups.clone()
-    };
+    let mut provider = opts.provider.clone();
 
-    let mut cfg = ServerConfig::builder_with_provider(
-        CryptoProvider {
-            kx_groups,
-            ..opts.provider.clone()
-        }
-        .into(),
-    )
-    .with_protocol_versions(&opts.supported_versions())
-    .unwrap()
-    .with_client_cert_verifier(client_auth)
-    .with_single_cert_with_ocsp(cert.clone(), key, opts.server_ocsp_response.clone())
-    .unwrap();
+    if let Some(groups) = &opts.groups {
+        provider
+            .kx_groups
+            .retain(|kxg| groups.contains(&kxg.name()));
+    }
+
+    let mut cfg = ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&opts.supported_versions())
+        .unwrap()
+        .with_client_cert_verifier(client_auth)
+        .with_single_cert_with_ocsp(cert.clone(), key, opts.server_ocsp_response.clone())
+        .unwrap();
 
     cfg.session_storage = ServerCacheWithResumptionDelay::new(opts.resumption_delay);
     cfg.max_fragment_size = opts.max_fragment;
     cfg.send_tls13_tickets = 1;
     cfg.require_ems = opts.require_ems;
+    cfg.ignore_client_order = opts.server_preference;
 
     if opts.use_signing_scheme > 0 {
         let scheme = lookup_scheme(opts.use_signing_scheme);
@@ -587,7 +644,7 @@ fn make_server_cfg(opts: &Options) -> Arc<ServerConfig> {
     }
 
     if opts.tickets {
-        cfg.ticketer = provider::Ticketer::new().unwrap();
+        cfg.ticketer = opts.selected_provider.ticketer();
     } else if opts.resumes == 0 {
         cfg.session_storage = Arc::new(server::NoServerSessionStorage {});
     }
@@ -698,52 +755,44 @@ impl Debug for ClientCacheWithoutKxHints {
 }
 
 fn make_client_cfg(opts: &Options) -> Arc<ClientConfig> {
-    let kx_groups = if let Some(curves) = &opts.curves {
-        curves
-            .iter()
-            .map(|curveid| lookup_kx_group(*curveid))
-            .collect()
-    } else {
-        opts.provider.kx_groups.clone()
-    };
+    let mut provider = opts.provider.clone();
 
-    let cfg = ClientConfig::builder_with_provider(
-        CryptoProvider {
-            kx_groups,
-            ..opts.provider.clone()
+    if let Some(groups) = &opts.groups {
+        provider
+            .kx_groups
+            .retain(|kxg| groups.contains(&kxg.name()));
+    }
+
+    let cfg = ClientConfig::builder_with_provider(provider.into());
+
+    let cfg = if opts.selected_provider.supports_ech() {
+        if let Some(ech_config_list) = &opts.ech_config_list {
+            let ech_mode: EchMode = EchConfig::new(ech_config_list.clone(), ALL_HPKE_SUITES)
+                .unwrap_or_else(|_| quit(":INVALID_ECH_CONFIG_LIST:"))
+                .into();
+
+            cfg.with_ech(ech_mode)
+                .expect("invalid ECH config")
+        } else if opts.enable_ech_grease {
+            let ech_mode = EchMode::Grease(EchGreaseConfig::new(
+                GREASE_HPKE_SUITE,
+                HpkePublicKey(GREASE_25519_PUBKEY.to_vec()),
+            ));
+
+            cfg.with_ech(ech_mode)
+                .expect("invalid GREASE ECH config")
+        } else {
+            cfg.with_protocol_versions(&opts.supported_versions())
+                .expect("inconsistent settings")
         }
-        .into(),
-    );
-
-    #[cfg(feature = "aws_lc_rs")]
-    let cfg = if let Some(ech_config_list) = &opts.ech_config_list {
-        let ech_mode: EchMode = EchConfig::new(ech_config_list.clone(), hpke::ALL_SUPPORTED_SUITES)
-            .unwrap_or_else(|_| quit(":INVALID_ECH_CONFIG_LIST:"))
-            .into();
-
-        cfg.with_ech(ech_mode)
-            .expect("invalid ECH config")
-    } else if opts.enable_ech_grease {
-        let ech_mode = EchMode::Grease(EchGreaseConfig::new(
-            GREASE_HPKE_SUITE,
-            HpkePublicKey(GREASE_25519_PUBKEY.to_vec()),
-        ));
-
-        cfg.with_ech(ech_mode)
-            .expect("invalid GREASE ECH config")
     } else {
         cfg.with_protocol_versions(&opts.supported_versions())
             .expect("inconsistent settings")
     };
 
-    #[cfg(not(feature = "aws_lc_rs"))]
-    let cfg = cfg
-        .with_protocol_versions(&opts.supported_versions())
-        .expect("inconsistent settings");
-
     let cfg = cfg
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(DummyServerAuth::new()));
+        .with_custom_certificate_verifier(Arc::new(DummyServerAuth::new(&opts.trusted_cert_file)));
 
     let mut cfg = if !opts.cert_file.is_empty() && !opts.key_file.is_empty() {
         let cert = load_cert(&opts.cert_file);
@@ -861,7 +910,6 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         Error::PeerIncompatible(PeerIncompatible::ServerRejectedEncryptedClientHello(
             _retry_configs,
         )) => {
-            #[cfg(feature = "aws_lc_rs")]
             if let Some(expected_configs) = &opts.expect_ech_retry_configs {
                 let expected_configs =
                     Vec::<EchConfigPayload>::read(&mut Reader::init(expected_configs)).unwrap();
@@ -914,6 +962,7 @@ fn handle_err(opts: &Options, err: Error) -> ! {
         {
             quit(":UNEXPECTED_EXTENSION:")
         }
+        Error::PeerMisbehaved(PeerMisbehaved::SelectedUnofferedKxGroup) => quit(":WRONG_CURVE:"),
         Error::PeerMisbehaved(_) => quit(":PEER_MISBEHAVIOUR:"),
         Error::NoCertificatesPresented => quit(":NO_CERTS:"),
         Error::AlertReceived(AlertDescription::UnexpectedMessage) => quit(":BAD_ALERT:"),
@@ -1121,11 +1170,9 @@ fn exec(opts: &Options, mut sess: Connection, count: usize) {
             }
         }
 
-        if opts.expect_handshake_kind.is_some() && !sess.is_handshaking() {
-            let expected_options = opts
-                .expect_handshake_kind
-                .as_ref()
-                .unwrap();
+        if let (Some(expected_options), false) =
+            (opts.expect_handshake_kind.as_ref(), sess.is_handshaking())
+        {
             let actual = sess.handshake_kind().unwrap();
             assert!(
                 expected_options.contains(&actual),
@@ -1133,7 +1180,46 @@ fn exec(opts: &Options, mut sess: Connection, count: usize) {
             );
         }
 
-        #[cfg(feature = "aws_lc_rs")]
+        if let Some(curve_id) = &opts.expect_curve_id {
+            // unlike openssl/boringssl's API, `negotiated_key_exchange_group`
+            // works for the connection, not session.  this means TLS1.2
+            // resumptions never have a value for `negotiated_key_exchange_group`
+            let tls12_resumed = sess.protocol_version() == Some(ProtocolVersion::TLSv1_2)
+                && sess.handshake_kind() == Some(HandshakeKind::Resumed);
+            let negotiated_key_exchange_group_ready = !(sess.is_handshaking() || tls12_resumed);
+
+            if negotiated_key_exchange_group_ready {
+                let actual = sess
+                    .negotiated_key_exchange_group()
+                    .expect("no kx with -expect-curve-id");
+                assert_eq!(curve_id, &actual.name());
+            }
+        }
+
+        if let Some(curve_id) = &opts.on_initial_expect_curve_id {
+            if !sess.is_handshaking() && count == 0 {
+                assert_eq!(sess.handshake_kind().unwrap(), HandshakeKind::Full);
+                assert_eq!(
+                    sess.negotiated_key_exchange_group()
+                        .expect("no kx with -on-initial-expect-curve-id")
+                        .name(),
+                    *curve_id
+                );
+            }
+        }
+
+        if let Some(curve_id) = &opts.on_resume_expect_curve_id {
+            if !sess.is_handshaking() && count > 0 {
+                assert_eq!(sess.handshake_kind().unwrap(), HandshakeKind::Resumed);
+                assert_eq!(
+                    sess.negotiated_key_exchange_group()
+                        .expect("no kx with -on-resume-expect-curve-id")
+                        .name(),
+                    *curve_id
+                );
+            }
+        }
+
         {
             let ech_accept_required =
                 (count == 0 && opts.on_initial_expect_ech_accept) || opts.expect_ech_accept;
@@ -1221,6 +1307,9 @@ pub fn main() {
             "-cert-file" => {
                 opts.cert_file = args.remove(0);
             }
+            "-trust-cert" => {
+                opts.trusted_cert_file = args.remove(0);
+            }
             "-resume-count" => {
                 opts.resumes = args.remove(0).parse::<usize>().unwrap();
             }
@@ -1278,9 +1367,16 @@ pub fn main() {
             "-verify-prefs" => {
                 lookup_scheme(args.remove(0).parse::<u16>().unwrap());
             }
+            "-expect-curve-id" => {
+                opts.expect_curve_id = Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
+            }
+            "-on-initial-expect-curve-id" => {
+                opts.on_initial_expect_curve_id = Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
+            }
+            "-on-resume-expect-curve-id" => {
+                opts.on_resume_expect_curve_id = Some(NamedGroup::from(args.remove(0).parse::<u16>().unwrap()));
+            }
             "-max-cert-list" |
-            "-expect-curve-id" |
-            "-expect-resume-curve-id" |
             "-expect-peer-signature-algorithm" |
             "-expect-peer-verify-pref" |
             "-expect-advertised-alpn" |
@@ -1441,11 +1537,12 @@ pub fn main() {
                 opts.expect_version = args.remove(0).parse::<u16>().unwrap();
             }
             "-curves" => {
-                let curve = args.remove(0).parse::<u16>().unwrap();
-                if let Some(mut curves) = opts.curves.take() {
-                    curves.push(curve);
-                } else {
-                    opts.curves = Some(vec![ curve ]);
+                let group = NamedGroup::from(args.remove(0).parse::<u16>().unwrap());
+                opts.groups.get_or_insert(Vec::new()).push(group);
+
+                // if X25519Kyber768Draft00 is requested, insert it from rustls_post_quantum
+                if group == rustls_post_quantum::X25519Kyber768Draft00.name() && opts.selected_provider == SelectedProvider::PostQuantum {
+                    opts.provider.kx_groups.insert(0, &rustls_post_quantum::X25519Kyber768Draft00);
                 }
             }
             "-resumption-delay" => {
@@ -1461,11 +1558,9 @@ pub fn main() {
             "-install-one-cert-compression-alg" => {
                 opts.install_cert_compression_algs = CompressionAlgs::One(args.remove(0).parse::<u16>().unwrap());
             }
-            #[cfg(feature = "fips")]
-            "-fips-202205" => {
+            "-fips-202205" if opts.selected_provider == SelectedProvider::AwsLcRsFips => {
                 opts.provider = rustls::crypto::default_fips_provider();
             }
-            #[cfg(not(feature = "fips"))]
             "-fips-202205" => {
                 println!("Not a FIPS build");
                 process::exit(BOGO_NACK);
@@ -1502,6 +1597,9 @@ pub fn main() {
             "-enable-ech-grease" => {
                 opts.enable_ech_grease = true;
             }
+            "-server-preference" => {
+                opts.server_preference = true;
+            }
 
             // defaults:
             "-enable-all-curves" |
@@ -1533,10 +1631,12 @@ pub fn main() {
             "-fail-cert-callback" |
             "-install-ddos-callback" |
             "-advertise-npn" |
+            "-advertise-empty-npn" |
             "-verify-fail" |
             "-expect-channel-id" |
             "-send-channel-id" |
             "-select-next-proto" |
+            "-select-empty-next-proto" |
             "-expect-verify-result" |
             "-send-alert" |
             "-digest-prefs" |
@@ -1555,7 +1655,6 @@ pub fn main() {
             "-expect-draft-downgrade" |
             "-allow-unknown-alpn-protos" |
             "-on-initial-tls13-variant" |
-            "-on-initial-expect-curve-id" |
             "-on-resume-export-early-keying-material" |
             "-on-resume-enable-early-data" |
             "-export-early-keying-material" |
@@ -1575,6 +1674,13 @@ pub fn main() {
             "-use-custom-verify-callback" => {
                 println!("NYI option {:?}", arg);
                 process::exit(BOGO_NACK);
+            }
+
+            "-print-rustls-provider" => {
+                println!("{}", "*".repeat(66));
+                println!("rustls provider is {:?}", opts.selected_provider);
+                println!("{}", "*".repeat(66));
+                process::exit(0);
             }
 
             _ => {
@@ -1760,7 +1866,8 @@ impl compress::CertCompressor for RandomAlgorithm {
     ) -> Result<Vec<u8>, compress::CompressionFailed> {
         let random_byte = {
             let mut bytes = [0];
-            provider::default_provider()
+            // nb. provider is irrelevant for this use
+            ring::default_provider()
                 .secure_random
                 .fill(&mut bytes)
                 .unwrap();
@@ -1771,11 +1878,27 @@ impl compress::CertCompressor for RandomAlgorithm {
     }
 }
 
-#[cfg(feature = "aws_lc_rs")]
 static GREASE_HPKE_SUITE: &dyn Hpke = hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
 
-#[cfg(feature = "aws_lc_rs")]
 const GREASE_25519_PUBKEY: &[u8] = &[
     0x67, 0x35, 0xCA, 0x50, 0x21, 0xFC, 0x4F, 0xE6, 0x29, 0x3B, 0x31, 0x2C, 0xB5, 0xE0, 0x97, 0xD8,
     0xD0, 0x58, 0x97, 0xCF, 0x5C, 0x15, 0x12, 0x79, 0x4B, 0xEF, 0x1D, 0x98, 0x52, 0x74, 0xDC, 0x5E,
+];
+
+// nb. hpke::ALL_SUPPORTED_SUITES omits fips-incompatible options,
+// this includes them. bogo fips tests are activated by -fips-202205
+// (and no ech tests use that option)
+static ALL_HPKE_SUITES: &[&dyn Hpke] = &[
+    hpke::DH_KEM_P256_HKDF_SHA256_AES_128,
+    hpke::DH_KEM_P256_HKDF_SHA256_AES_256,
+    hpke::DH_KEM_P256_HKDF_SHA256_CHACHA20_POLY1305,
+    hpke::DH_KEM_P384_HKDF_SHA384_AES_128,
+    hpke::DH_KEM_P384_HKDF_SHA384_AES_256,
+    hpke::DH_KEM_P384_HKDF_SHA384_CHACHA20_POLY1305,
+    hpke::DH_KEM_P521_HKDF_SHA512_AES_128,
+    hpke::DH_KEM_P521_HKDF_SHA512_AES_256,
+    hpke::DH_KEM_P521_HKDF_SHA512_CHACHA20_POLY1305,
+    hpke::DH_KEM_X25519_HKDF_SHA256_AES_128,
+    hpke::DH_KEM_X25519_HKDF_SHA256_AES_256,
+    hpke::DH_KEM_X25519_HKDF_SHA256_CHACHA20_POLY1305,
 ];

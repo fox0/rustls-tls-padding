@@ -5,23 +5,25 @@
 
 set -xe
 
+cargo run -- -print-rustls-provider
+
 case ${BOGO_SHIM_PROVIDER:-aws-lc-rs} in
   ring)
-      cargo build -p rustls --example bogo_shim $(../admin/all-features-except aws-lc-rs,aws_lc_rs,fips rustls)
       cpp -P -DRING config.json.in > config.json
       ;;
   aws-lc-rs)
-      cargo build -p rustls --example bogo_shim $(../admin/all-features-except ring,fips rustls)
       cpp -P -DAWS_LC_RS config.json.in > config.json
       ;;
   aws-lc-rs-fips)
-      cargo build -p rustls --example bogo_shim $(../admin/all-features-except ring rustls)
       cpp -P -DAWS_LC_RS -DFIPS config.json.in > config.json
+      ;;
+  post-quantum)
+      cpp -P -DAWS_LC_RS -DPOST_QUANTUM config.json.in > config.json
       ;;
   existing)
       ;;
   *)
-      echo "unsupported BOGO_SHIM_PROVIDER: supported are (ring|aws-lc-rs|existing)"
+      echo "unsupported BOGO_SHIM_PROVIDER: supported are (ring|aws-lc-rs|aws-lc-rs-fips|post-quantum|existing)"
       exit 1
       ;;
 esac
@@ -34,7 +36,7 @@ fi
 # Best effort on OS-X
 case $OSTYPE in darwin*) set +e ;; esac
 
-( cd bogo/ssl/test/runner && ./runner.test -shim-path ../../../../../target/debug/examples/bogo_shim \
+( cd bogo/ssl/test/runner && ./runner.test -shim-path ../../../../../target/debug/bogo \
      -shim-config ../../../../config.json \
      -pipe \
      -allow-unimplemented \

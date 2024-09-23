@@ -10,7 +10,9 @@ use rustls::unbuffered::{
     UnbufferedStatus, WriteTraffic,
 };
 use rustls::version::TLS13;
-use rustls::{ClientConfig, Error, ServerConfig, SideData};
+use rustls::{
+    AlertDescription, CertificateError, ClientConfig, Error, InvalidMessage, ServerConfig, SideData,
+};
 
 use super::*;
 
@@ -28,9 +30,6 @@ fn tls12_handshake() {
             "Ok(EncodeTlsData)",
             "Ok(TransmitTlsData)",
             "Ok(BlockedHandshake)",
-            "Ok(BlockedHandshake)",
-            "Ok(BlockedHandshake)",
-            "Ok(BlockedHandshake)",
             "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
@@ -45,9 +44,6 @@ fn tls12_handshake() {
         outcome.server_transcript,
         vec![
             "Ok(BlockedHandshake)",
-            "Ok(EncodeTlsData)",
-            "Ok(EncodeTlsData)",
-            "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
             "Ok(TransmitTlsData)",
             "Ok(BlockedHandshake)",
@@ -73,9 +69,6 @@ fn tls13_handshake() {
             "Ok(BlockedHandshake)",
             "Ok(EncodeTlsData)",
             "Ok(TransmitTlsData)",
-            "Ok(BlockedHandshake)",
-            "Ok(BlockedHandshake)",
-            "Ok(BlockedHandshake)",
             "Ok(EncodeTlsData)",
             "Ok(TransmitTlsData)",
             "Ok(WriteTraffic)",
@@ -90,9 +83,6 @@ fn tls13_handshake() {
         outcome.server_transcript,
         vec![
             "Ok(BlockedHandshake)",
-            "Ok(EncodeTlsData)",
-            "Ok(EncodeTlsData)",
-            "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
@@ -225,7 +215,6 @@ fn early_data() {
             "Ok(TransmitTlsData)",
             "Ok(BlockedHandshake)",
             "Ok(BlockedHandshake)",
-            "Ok(BlockedHandshake)",
             "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
             "Ok(TransmitTlsData)",
@@ -240,7 +229,6 @@ fn early_data() {
         outcome.server_transcript,
         vec![
             "Ok(BlockedHandshake)",
-            "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
             "Ok(EncodeTlsData)",
@@ -784,7 +772,7 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
         }
     };
 
-    let mut data = encode_tls_data(client.process_tls_records(&mut []));
+    let (mut data, _) = encode_tls_data(client.process_tls_records(&mut []));
     let data_len = data.len();
 
     match server.process_tls_records(&mut data) {
@@ -794,6 +782,69 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
         } if discard == data_len => {}
         st => panic!("unexpected server state {st:?}"),
     }
+}
+
+#[test]
+fn tls13_packed_handshake() {
+    // transcript requires selection of X25519
+    if provider_is_fips() {
+        return;
+    }
+
+    // regression test for https://github.com/rustls/rustls/issues/2040
+    let client_config = finish_client_config(
+        KeyType::Rsa2048,
+        ClientConfig::builder_with_provider(unsafe_plaintext_crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap(),
+    );
+
+    let mut client =
+        UnbufferedClientConnection::new(Arc::new(client_config), server_name("localhost")).unwrap();
+
+    let (_hello, _) = encode_tls_data(client.process_tls_records(&mut []));
+    confirm_transmit_tls_data(client.process_tls_records(&mut []));
+
+    let mut first_flight = include_bytes!("data/bug2040-message-1.bin").to_vec();
+    let (_ccs, discard) = encode_tls_data(client.process_tls_records(&mut first_flight[..]));
+    assert_eq!(discard, first_flight.len());
+
+    let mut second_flight = include_bytes!("data/bug2040-message-2.bin").to_vec();
+    let UnbufferedStatus { state, .. } = client.process_tls_records(&mut second_flight[..]);
+    assert_eq!(
+        state.unwrap_err(),
+        Error::InvalidCertificate(CertificateError::UnknownIssuer)
+    );
+}
+
+#[test]
+fn rejects_junk() {
+    let mut server =
+        UnbufferedServerConnection::new(Arc::new(make_server_config(KeyType::Rsa2048))).unwrap();
+
+    let mut buf = [0xff; 5];
+    let UnbufferedStatus { discard, state } = server.process_tls_records(&mut buf);
+    assert_eq!(discard, 0);
+    assert_eq!(
+        state.unwrap_err(),
+        Error::InvalidMessage(InvalidMessage::InvalidContentType)
+    );
+
+    // sends alert
+    let (data, _) = encode_tls_data(server.process_tls_records(&mut []));
+    assert_eq!(
+        data,
+        &[
+            0x15,
+            0x03,
+            0x03,
+            0x00,
+            0x02,
+            0x02,
+            u8::from(AlertDescription::DecodeError)
+        ]
+    );
+    confirm_transmit_tls_data(server.process_tls_records(&mut []));
 }
 
 fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<T>) -> R>(
@@ -810,10 +861,10 @@ fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<T>) -> R>(
     }
 }
 
-fn encode_tls_data<T: SideData>(status: UnbufferedStatus<'_, '_, T>) -> Vec<u8> {
+fn encode_tls_data<T: SideData>(status: UnbufferedStatus<'_, '_, T>) -> (Vec<u8>, usize) {
     match status {
         UnbufferedStatus {
-            discard: 0,
+            discard,
             state: Ok(ConnectionState::EncodeTlsData(mut etd)),
         } => {
             let len = match etd.encode(&mut []) {
@@ -824,10 +875,24 @@ fn encode_tls_data<T: SideData>(status: UnbufferedStatus<'_, '_, T>) -> Vec<u8> 
             };
             let mut buf = vec![0u8; len];
             etd.encode(&mut buf).unwrap();
-            buf
+            (buf, discard)
         }
         _ => {
             panic!("unexpected state {status:?} (wanted EncodeTlsData)");
+        }
+    }
+}
+
+fn confirm_transmit_tls_data<T: SideData>(status: UnbufferedStatus<'_, '_, T>) {
+    match status {
+        UnbufferedStatus {
+            discard: 0,
+            state: Ok(ConnectionState::TransmitTlsData(ttd)),
+        } => {
+            ttd.done();
+        }
+        _ => {
+            panic!("unexpected state {status:?} (wanted TransmitTlsData)");
         }
     }
 }
